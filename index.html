@@ -20,6 +20,9 @@ header{height:58px;background:#191e2b;border-bottom:1px solid #30374a;display:fl
 #status{font-size:12px;color:#9da5ba}
 #profileBtn{width:37px;height:37px;border-radius:50%;background:#30375a;color:white;font-weight:bold;font-size:17px;overflow:hidden}
 #profileBtn img{width:100%;height:100%;object-fit:cover}
+#notificationBtn{width:37px;height:37px;border-radius:50%;background:#30375a;color:white;font-size:18px;position:relative}
+#notificationBtn.enabled{background:#245b4c}
+#notificationDot{position:absolute;right:2px;top:2px;width:9px;height:9px;border-radius:50%;background:#ff4058;display:none}
 .screen{display:none;flex:1;min-height:0;overflow:hidden}
 .screen.active{display:flex}
 #authScreen{align-items:center;justify-content:center;padding:20px}
@@ -114,27 +117,9 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .profile-heading button{background:#292f40;color:white;padding:9px 12px;border-radius:9px}
 .photo-pick{display:inline-flex;align-items:center;justify-content:center;background:#30375a;color:#e4e6ff;border-radius:10px;padding:11px 15px;margin-top:8px;font-size:13px;font-weight:bold;cursor:pointer}
 #profileFile{display:none}
-#profileModal .modal{
- max-width:420px;
- display:block;
- overflow-y:auto;
- overflow-x:hidden;
-}
-#profileModal .profile-heading{
- position:sticky;
- top:-17px;
- background:#191e2b;
- padding:8px 0;
- z-index:3;
-}
-#profileModal .modal-actions{
- position:sticky;
- bottom:-17px;
- background:#191e2b;
- padding:12px 0 5px;
- margin-top:14px;
- z-index:3;
-}
+#profileModal .modal{max-width:420px;display:block;overflow-y:auto;overflow-x:hidden}
+#profileModal .profile-heading{position:sticky;top:-17px;background:#191e2b;padding:8px 0;z-index:3}
+#profileModal .modal-actions{position:sticky;bottom:-17px;background:#191e2b;padding:12px 0 5px;margin-top:14px;z-index:3}
 #actionModal .modal{max-width:350px}
 .quick-reactions{display:flex;justify-content:space-around;font-size:25px;padding:12px 0}
 .quick-reactions span{cursor:pointer}
@@ -173,6 +158,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
  <div class="logo">StableX</div>
  <div class="header-right">
   <div id="status">Bağlanıyor...</div>
+  <button id="notificationBtn" onclick="setupNotifications()" title="Bildirimleri aç">🔔<span id="notificationDot"></span></button>
   <button id="profileBtn" onclick="openProfile()">?</button>
  </div>
 </header>
@@ -311,6 +297,117 @@ let chatPins={private:new Set(),group:new Set()};
 let chatMutes={private:new Set(),group:new Set()};
 let lastTypingWrite=0;
 
+/* BİLDİRİM SİSTEMİ */
+const VAPID_PUBLIC_KEY="BURAYA_VAPID_PUBLIC_KEY";
+
+let notificationPermission=false;
+let notificationSubscription=null;
+let knownMessageIds=new Set();
+
+function base64ToUint8Array(value){
+ const padding="=".repeat((4-value.length%4)%4);
+ const base64=(value+padding).replace(/-/g,"+").replace(/_/g,"/");
+ const raw=atob(base64);
+ return Uint8Array.from([...raw].map(c=>c.charCodeAt(0)));
+}
+
+async function setupNotifications(){
+ try{
+  if(!("Notification" in window)){
+   throw new Error("Bu tarayıcı bildirimleri desteklemiyor.");
+  }
+  if(!("serviceWorker" in navigator)){
+   throw new Error("Service Worker desteklenmiyor.");
+  }
+  if(VAPID_PUBLIC_KEY==="BURAYA_VAPID_PUBLIC_KEY"){
+   throw new Error("Push bildirim anahtarı henüz ayarlanmamış.");
+  }
+
+  const permission=await Notification.requestPermission();
+  if(permission!=="granted"){
+   throw new Error("Bildirim izni verilmedi.");
+  }
+
+  notificationPermission=true;
+
+  const registration=await navigator.serviceWorker.register("/sw.js");
+  let subscription=await registration.pushManager.getSubscription();
+
+  if(!subscription){
+   subscription=await registration.pushManager.subscribe({
+    userVisibleOnly:true,
+    applicationServerKey:base64ToUint8Array(VAPID_PUBLIC_KEY)
+   });
+  }
+
+  notificationSubscription=subscription;
+
+  const json=subscription.toJSON();
+
+  const {error}=await db.from("push_subscriptions").upsert({
+   user_id:myId,
+   endpoint:subscription.endpoint,
+   p256dh:json.keys.p256dh,
+   auth:json.keys.auth
+  },{onConflict:"endpoint"});
+
+  if(error)throw error;
+
+  $("notificationBtn").classList.add("enabled");
+  $("notificationBtn").title="Bildirimler açık";
+  toast("Bildirimler etkinleştirildi.");
+
+ }catch(e){
+  toast("Bildirim hatası: "+e.message);
+ }
+}
+
+async function requestStableXPush(type,messageId){
+ try{
+  const {data}=await db.auth.getSession();
+  const token=data?.session?.access_token;
+  if(!token)return;
+
+  const response=await fetch("/.netlify/functions/send-push",{
+   method:"POST",
+   headers:{
+    "Content-Type":"application/json",
+    "Authorization":"Bearer "+token
+   },
+   body:JSON.stringify({
+    type,
+    message_id:messageId
+   })
+  });
+
+  if(!response.ok){
+   console.error("Push bildirimi gönderilemedi:",await response.text());
+  }
+ }catch(e){
+  console.error("Push bildirimi:",e);
+ }
+}
+
+function showLocalNotification(title,body,tag){
+ if(!notificationPermission||document.visibilityState==="visible")return;
+
+ if("serviceWorker" in navigator){
+  navigator.serviceWorker.ready.then(registration=>{
+   registration.showNotification(title,{
+    body,
+    icon:"/icon-192.png",
+    badge:"/icon-192.png",
+    tag:tag||"stablex-message",
+    renotify:false
+   });
+  }).catch(()=>{});
+ }
+}
+
+function rememberMessageIds(messages){
+ (messages||[]).forEach(m=>knownMessageIds.add(String(m.id)));
+}
+
 function toast(message){
  const el=$("toast");el.textContent=message;el.style.display="block";
  clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.style.display="none",3500);
@@ -380,7 +477,18 @@ function enterApp(){
  setPresence(true);refreshAll();
  if(refreshTimer)clearInterval(refreshTimer);
  refreshTimer=setInterval(refreshAll,5000);
+ checkNotificationPermission();
 }
+
+async function checkNotificationPermission(){
+ if(!("Notification" in window))return;
+ if(Notification.permission==="granted"){
+  notificationPermission=true;
+  $("notificationBtn").classList.add("enabled");
+  $("notificationBtn").title="Bildirim izni verilmiş";
+ }
+}
+
 function updateMyProfileDisplay(){
  const u=myProfile?.username||"Kullanıcı";
  const display=myProfile?.display_name||u;
@@ -419,7 +527,6 @@ async function loadChatSettings(){
  }catch(e){console.warn("Sohbet ayarları:",e.message)}
 }
 
-/* Sohbet temizleme zamanını al */
 async function getClearTime(type,id){
  const table=type==="group"?"group_chat_settings":"private_chat_settings";
  const field=type==="group"?"group_id":"other_user_id";
@@ -429,7 +536,6 @@ async function getClearTime(type,id){
  return data?.cleared_at||null;
 }
 
-/* Yanıtlanan mesajların gerçek içeriklerini al */
 async function getReplyContents(messages,type){
  const ids=[...new Set((messages||[]).map(m=>m.reply_to_id).filter(Boolean))];
  if(!ids.length)return {};
@@ -868,7 +974,6 @@ function addMessage(msg,username,reactions=[],readers=[]){
   names.textContent="👁 "+readers.map(x=>x.display_name||x.username).join(", ");
   bubble.append(names);
  }
- bubble.addEventListener("dblclick",()=>toggleReaction(msg.id,"❤️"));
  $("messages").append(bubble);
 }
 
@@ -991,28 +1096,57 @@ async function loadGroupMessages(){
  }catch(e){console.error("Grup mesajları:",e)}
 }
 
-/* Mesaj gönderme */
+/* GÜNCELLENDİ: Mesaj gönderme ve bildirim */
 async function sendMessage(){
  if(!selectedChat)return;
- const input=$("messageInput"),content=input.value;
- if(!content.trim())return;
+ const input=$("messageInput");
+ const content=input.value.trim();
+ if(!content)return;
+
  $("sendBtn").disabled=true;
+
  try{
-  const payload={sender_id:myId,content,reply_to_id:replyTarget?.id||null};
+  const target={type:selectedChat.type,id:selectedChat.id};
+  const payload={
+   sender_id:myId,
+   content,
+   reply_to_id:replyTarget?.id||null
+  };
+
   let result;
-  if(selectedChat.type==="private"){
-   result=await db.from("messages").insert({...payload,receiver_id:selectedChat.id});
+
+  if(target.type==="private"){
+   result=await db.from("messages")
+    .insert({...payload,receiver_id:target.id})
+    .select("id")
+    .single();
   }else{
-   result=await db.from("group_messages").insert({...payload,group_id:selectedChat.id});
+   result=await db.from("group_messages")
+    .insert({...payload,group_id:target.id})
+    .select("id")
+    .single();
   }
+
   if(result.error)throw result.error;
-  input.value="";cancelReply();
-  if(selectedChat.type==="private")await loadPrivateMessages();
+
+  input.value="";
+  cancelReply();
+
+  if(target.type==="private")await loadPrivateMessages();
   else await loadGroupMessages();
+
   await refreshAll();
- }catch(e){toast("Mesaj gönderilemedi: "+e.message)}
- finally{$("sendBtn").disabled=false;input.focus()}
+
+  requestStableXPush(target.type,result.data.id);
+
+ }catch(e){
+  toast("Mesaj gönderilemedi: "+e.message);
+ }finally{
+  $("sendBtn").disabled=false;
+  input.focus();
+ }
 }
+
 $("messageInput").addEventListener("keydown",e=>{
  if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMessage()}
 });
@@ -1066,52 +1200,30 @@ async function quickReact(emoji){
  await toggleReaction(actionMessage.id,emoji);closeActions();
 }
 
-/* GÜNCELLENDİ: Grup tepkisi kaydetme */
 async function toggleReaction(id,emoji){
  if(!selectedChat)return;
 
  const isGroup=selectedChat.type==="group";
- const table=isGroup
-  ?"group_message_reactions"
-  :"message_reactions";
- const field=isGroup
-  ?"group_message_id"
-  :"message_id";
+ const table=isGroup?"group_message_reactions":"message_reactions";
+ const field=isGroup?"group_message_id":"message_id";
 
  try{
   const {data:old,error}=await db.from(table).select("*")
-   .eq(field,id)
-   .eq("user_id",myId)
-   .maybeSingle();
+   .eq(field,id).eq("user_id",myId).maybeSingle();
 
   if(error)throw error;
 
   if(old?.emoji===emoji){
    const {error:de}=await db.from(table).delete()
-    .eq(field,id)
-    .eq("user_id",myId);
-
+    .eq(field,id).eq("user_id",myId);
    if(de)throw de;
   }else{
-   const payload={
-    [field]:id,
-    user_id:myId,
-    emoji
-   };
-
-   /*
-    * Grup tepkilerinde eski RLS politikasının
-    * kontrol ettiği message_id alanını da doldur.
-    */
-   if(isGroup){
-    payload.message_id=id;
-   }
+   const payload={[field]:id,user_id:myId,emoji};
+   if(isGroup)payload.message_id=id;
 
    const {error:up}=await db.from(table).upsert(
-    payload,
-    {onConflict:field+",user_id"}
+    payload,{onConflict:field+",user_id"}
    );
-
    if(up)throw up;
   }
 
@@ -1414,7 +1526,6 @@ async function uploadAvatar(file){
 }
 
 async function saveProfile(){
- /* Kullanıcı adı bu işlemde kesinlikle güncellenmez. */
  const displayName=$("profileDisplayName").value.trim();
  const bio=$("profileBio").value.trim();
  const file=$("profileFile").files[0];
